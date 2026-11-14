@@ -16,6 +16,8 @@
     "postinstall": "wxt prepare"
   },
   "devDependencies": {
+    "@tailwindcss/vite": "^4.1.4",
+    "tailwindcss": "^4.1.4",
     "typescript": "^5.9.3",
     "wxt": "^0.21.5"
   }

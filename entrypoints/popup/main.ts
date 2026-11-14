@@ -1,86 +1,145 @@
+import './style.css';
 import { browser } from 'wxt/browser';
 import { MESSAGE, type PopupState, type TabVolumeInfo } from '@/lib/messages';
-import { clampVolume, DEFAULT_VOLUME, formatVolume } from '@/lib/volume';
+import { clampVolume, DEFAULT_VOLUME, formatVolume, MAX_VOLUME } from '@/lib/volume';
 
 const slider = document.querySelector<HTMLInputElement>('#slider')!;
 const percent = document.querySelector<HTMLElement>('#percent')!;
-const level = document.querySelector<HTMLElement>('.level')!;
 const muteButton = document.querySelector<HTMLButtonElement>('#mute')!;
 const speakerOn = document.querySelector<SVGElement>('#speaker-on')!;
 const speakerOff = document.querySelector<SVGElement>('#speaker-off')!;
+const tabMark = document.querySelector<HTMLElement>('#tab-mark')!;
+const tabTitle = document.querySelector<HTMLElement>('#tab-title')!;
+const tabHost = document.querySelector<HTMLElement>('#tab-host')!;
 const tabsList = document.querySelector<HTMLUListElement>('#tabs')!;
-const empty = document.querySelector<HTMLElement>('#empty')!;
+const others = document.querySelector<HTMLElement>('#others')!;
 const errorBox = document.querySelector<HTMLElement>('#error')!;
 const presetButtons = Array.from(document.querySelectorAll<HTMLButtonElement>('[data-volume]'));
 
+const TONE = {
+  muted: 'text-accent',
+  low: 'text-accent',
+  normal: 'text-ink',
+  boost: 'text-boost',
+  hot: 'text-hot',
+} as const;
+
+const TAB_ROW =
+  'flex w-full min-w-0 cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[13px] text-ink hover:bg-surface focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent';
+
 let currentTabId: number | null = null;
 let lastAudibleVolume = DEFAULT_VOLUME;
+let pendingVolume: number | null = null;
 
-function toneClass(volume: number): string {
-  if (volume === 0) return 'muted';
-  if (volume < DEFAULT_VOLUME) return 'low';
-  if (volume <= 200) return volume === DEFAULT_VOLUME ? '' : 'boost';
+function toneName(volume: number): keyof typeof TONE {
+  if (volume === 0 || volume < DEFAULT_VOLUME) return volume === 0 ? 'muted' : 'low';
+  if (volume === DEFAULT_VOLUME) return 'normal';
+  if (volume <= 200) return 'boost';
   return 'hot';
+}
+
+function fillFor(volume: number): string {
+  if (volume === 0 || volume < DEFAULT_VOLUME) return 'var(--color-accent)';
+  if (volume === DEFAULT_VOLUME) return 'var(--color-ok)';
+  if (volume <= 200) return 'var(--color-boost)';
+  return 'var(--color-hot)';
+}
+
+function initial(tab: Pick<TabVolumeInfo, 'title'>): string {
+  return (tab.title.trim().charAt(0) || '?').toUpperCase();
+}
+
+function statusLine(tab: TabVolumeInfo): string {
+  const host = tab.host || 'This tab';
+  if (tab.audible || tab.volume !== DEFAULT_VOLUME) return host;
+  return `${host} · not playing`;
+}
+
+function renderMark(tab: TabVolumeInfo): void {
+  tabMark.replaceChildren();
+  if (!tab.favIconUrl) {
+    tabMark.textContent = initial(tab);
+    return;
+  }
+  const icon = document.createElement('img');
+  icon.src = tab.favIconUrl;
+  icon.alt = '';
+  icon.className = 'size-4 rounded-sm';
+  icon.addEventListener('error', () => {
+    tabMark.replaceChildren(document.createTextNode(initial(tab)));
+  });
+  tabMark.append(icon);
 }
 
 function renderLevel(volume: number): void {
   const value = clampVolume(volume);
   slider.value = String(value);
+  const ratio = value / MAX_VOLUME;
+  slider.style.setProperty('--vg-p', `calc(8px + (100% - 16px) * ${ratio})`);
+  slider.style.setProperty('--vg-fill', fillFor(value));
   percent.textContent = String(value);
-  level.classList.remove('muted', 'low', 'boost', 'hot');
-  const tone = toneClass(value);
-  if (tone) level.classList.add(tone);
+  percent.classList.remove(...Object.values(TONE));
+  percent.classList.add(TONE[toneName(value)]);
   speakerOn.classList.toggle('hidden', value === 0);
   speakerOff.classList.toggle('hidden', value !== 0);
   muteButton.setAttribute('aria-label', value === 0 ? 'Unmute' : 'Mute');
   for (const button of presetButtons) {
-    button.classList.toggle('active', Number(button.dataset.volume) === value);
+    button.setAttribute('aria-pressed', String(Number(button.dataset.volume) === value));
   }
+}
+
+function renderCurrent(tab: TabVolumeInfo | null): void {
+  if (!tab) {
+    tabTitle.textContent = 'No tab';
+    tabHost.textContent = 'Open a page to control its volume';
+    tabMark.textContent = '?';
+    return;
+  }
+  tabTitle.textContent = tab.title;
+  tabTitle.title = tab.title;
+  tabHost.textContent = statusLine(tab);
+  renderMark(tab);
 }
 
 function renderTabs(next: PopupState): void {
   tabsList.replaceChildren();
-  const rows = next.tabs;
-  empty.classList.toggle('hidden', rows.length > 0);
+  const rows = next.tabs.filter((tab) => tab.id !== next.current?.id && tab.audible);
+  others.classList.toggle('hidden', rows.length === 0);
 
   for (const tab of rows) {
     const item = document.createElement('li');
     const button = document.createElement('button');
     button.type = 'button';
-    button.className = `tab${tab.active ? ' active' : ''}`;
+    button.className = TAB_ROW;
     button.dataset.tabId = String(tab.id);
+    button.title = tab.title;
 
     if (tab.favIconUrl) {
       const icon = document.createElement('img');
       icon.src = tab.favIconUrl;
       icon.alt = '';
-      icon.addEventListener('error', () => {
-        icon.replaceWith(fallbackIcon(tab));
-      });
+      icon.className = 'size-4 shrink-0 rounded-sm';
+      icon.addEventListener('error', () => icon.remove());
       button.append(icon);
     } else {
-      button.append(fallbackIcon(tab));
+      const mark = document.createElement('span');
+      mark.className = 'grid size-4 shrink-0 place-items-center rounded-sm bg-surface-2 text-[9px] font-semibold text-muted';
+      mark.textContent = initial(tab);
+      button.append(mark);
     }
 
     const title = document.createElement('span');
-    title.className = 'tab-title';
+    title.className = 'min-w-0 flex-1 truncate';
     title.textContent = tab.title;
 
     const vol = document.createElement('span');
-    vol.className = 'tab-vol';
+    vol.className = 'shrink-0 text-xs text-muted tabular-nums';
     vol.textContent = formatVolume(tab.volume);
 
     button.append(title, vol);
     item.append(button);
     tabsList.append(item);
   }
-}
-
-function fallbackIcon(tab: TabVolumeInfo): HTMLSpanElement {
-  const mark = document.createElement('span');
-  mark.className = 'tab-fallback';
-  mark.textContent = (tab.title.trim().charAt(0) || '?').toUpperCase();
-  return mark;
 }
 
 function showError(message?: string): void {
@@ -99,19 +158,33 @@ async function refresh(): Promise<void> {
     return;
   }
   currentTabId = next.current?.id ?? null;
+  renderCurrent(next.current);
   if (next.current) {
     if (next.current.volume > 0) lastAudibleVolume = next.current.volume;
     renderLevel(next.current.volume);
   }
   renderTabs(next);
   showError(next.error);
+
+  const queued = pendingVolume;
+  pendingVolume = null;
+  if (queued != null) {
+    await setVolume(queued);
+    return;
+  }
+  if (next.current && next.current.volume !== DEFAULT_VOLUME) {
+    await setVolume(next.current.volume, true);
+  }
 }
 
-async function setVolume(volume: number): Promise<void> {
-  if (currentTabId == null) return;
+async function setVolume(volume: number, quiet = false): Promise<void> {
   const value = clampVolume(volume);
   renderLevel(value);
   if (value > 0) lastAudibleVolume = value;
+  if (currentTabId == null) {
+    pendingVolume = value;
+    return;
+  }
   try {
     const next = await request<PopupState>({
       type: MESSAGE.setVolume,
@@ -120,9 +193,10 @@ async function setVolume(volume: number): Promise<void> {
     });
     if (!next) throw new Error('no response');
     renderTabs(next);
-    showError(next.error);
+    if (next.current) renderCurrent(next.current);
+    if (!quiet || next.error) showError(next.error);
   } catch {
-    showError('Cannot control volume on this page');
+    if (!quiet) showError('Cannot control volume on this page');
   }
 }
 

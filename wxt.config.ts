@@ -1,15 +1,19 @@
 import { defineConfig } from 'wxt';
+import tailwindcss from '@tailwindcss/vite';
 
 export default defineConfig({
   srcDir: '.',
   manifestVersion: 3,
+  vite: () => ({
+    plugins: [tailwindcss()],
+  }),
   manifest: ({ browser }) => ({
     name: 'Volume Guard',
     description: 'Boost and control volume up to 600% on any tab.',
     permissions:
       browser === 'firefox'
-        ? ['tabs', 'storage']
-        : ['tabs', 'storage', 'tabCapture', 'offscreen', 'scripting'],
+        ? ['tabs', 'storage', 'scripting']
+        : ['tabs', 'storage', 'tabCapture', 'offscreen', 'scripting', 'activeTab'],
     host_permissions: ['<all_urls>'],
     action: {
       default_title: 'Volume Guard',
