@@ -5,8 +5,8 @@
     "": {
       "name": "volumeguard",
       "devDependencies": {
-        "typescript": "^5.9.2",
-        "wxt": "^0.21.3",
+        "typescript": "^5.9.3",
+        "wxt": "^0.21.5",
       },
     },
   },
