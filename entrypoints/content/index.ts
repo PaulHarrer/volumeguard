@@ -16,5 +16,8 @@ export default defineContentScript({
         .catch(() => sendResponse({ ok: false }));
       return true;
     });
+    if (window.location.protocol === 'http:' || window.location.protocol === 'https:' || window !== window.top) {
+      void browser.runtime.sendMessage({ type: MESSAGE.pageReady }).catch(() => undefined);
+    }
   },
 });

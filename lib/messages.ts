@@ -3,6 +3,9 @@ export const MESSAGE = {
   setVolume: 'vg:set-volume',
   focusTab: 'vg:focus-tab',
   applyGain: 'vg:apply-gain',
+  saveSiteVolume: 'vg:save-site-volume',
+  removeSiteVolume: 'vg:remove-site-volume',
+  pageReady: 'vg:page-ready',
 } as const;
 
 export const AUDIO_PORT = 'vg-audio';
@@ -17,13 +20,20 @@ export interface TabVolumeInfo {
   audible: boolean;
   muted: boolean;
   volume: number;
+  savedVolume: number | null;
   active: boolean;
   windowId: number;
+}
+
+export interface SavedSiteVolume {
+  host: string;
+  volume: number;
 }
 
 export interface PopupState {
   current: TabVolumeInfo | null;
   tabs: TabVolumeInfo[];
+  savedSites: SavedSiteVolume[];
   error?: string;
 }
 
@@ -31,7 +41,10 @@ export type ExtensionMessage =
   | { type: typeof MESSAGE.getState }
   | { type: typeof MESSAGE.setVolume; tabId: number; volume: number }
   | { type: typeof MESSAGE.focusTab; tabId: number }
-  | { type: typeof MESSAGE.applyGain; gain: number };
+  | { type: typeof MESSAGE.applyGain; gain: number }
+  | { type: typeof MESSAGE.saveSiteVolume; host: string; volume: number; tabId?: number }
+  | { type: typeof MESSAGE.removeSiteVolume; host: string; tabId?: number }
+  | { type: typeof MESSAGE.pageReady };
 
 export type AudioOp = 'ping' | 'start' | 'gain' | 'stop';
 

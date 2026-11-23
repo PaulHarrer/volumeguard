@@ -68,11 +68,46 @@
         <button type="button" data-volume="600" aria-pressed="false" class="inline-flex h-8 min-w-0 cursor-pointer items-center justify-center rounded-lg border border-line bg-surface text-xs font-semibold text-ink transition-colors hover:border-accent/40 aria-pressed:border-accent aria-pressed:bg-accent/10 aria-pressed:text-accent focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">600%</button>
       </div>
 
+      <div id="site-save" class="mt-2.5 hidden items-center gap-1.5">
+        <button
+          id="save-site"
+          type="button"
+          aria-pressed="false"
+          class="inline-flex h-8 min-w-0 flex-1 cursor-pointer items-center justify-center gap-1.5 rounded-lg border border-line bg-surface px-2.5 text-xs font-medium text-ink transition-colors hover:border-accent/40 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent disabled:cursor-default"
+        >
+          <svg id="save-icon-outline" class="size-3.5 shrink-0" viewBox="0 0 24 24" aria-hidden="true">
+            <path
+              fill="currentColor"
+              d="M17 3H7c-1.1 0-2 .9-2 2v16l7-3 7 3V5c0-1.1-.9-2-2-2zm0 15-5-2.18L7 18V5h10v13z"
+            />
+          </svg>
+          <svg id="save-icon-filled" class="hidden size-3.5 shrink-0" viewBox="0 0 24 24" aria-hidden="true">
+            <path fill="currentColor" d="M17 3H7c-1.1 0-2 .9-2 2v16l7-3 7 3V5c0-1.1-.9-2-2-2z" />
+          </svg>
+          <span id="save-site-label" class="truncate">Save for this site</span>
+        </button>
+        <button
+          id="remove-site"
+          type="button"
+          class="hidden h-8 shrink-0 cursor-pointer items-center justify-center rounded-lg border border-line bg-surface px-2.5 text-xs font-medium text-muted transition-colors hover:border-hot/40 hover:text-hot focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+        >
+          Remove
+        </button>
+      </div>
+
       <p id="error" class="mt-3 hidden text-xs leading-4 text-hot" role="alert"></p>
 
       <section id="others" class="mt-4 hidden border-t border-line pt-3">
         <h2 class="mb-1.5 text-[11px] font-semibold tracking-[0.06em] text-muted uppercase">Other tabs</h2>
         <ul id="tabs" class="grid max-h-40 gap-0.5 overflow-y-auto"></ul>
+      </section>
+
+      <section id="saved-section" class="mt-4 hidden border-t border-line pt-3">
+        <div class="mb-1.5 flex items-center justify-between">
+          <h2 class="text-[11px] font-semibold tracking-[0.06em] text-muted uppercase">Saved sites</h2>
+          <span id="saved-count" class="text-[11px] font-medium text-muted tabular-nums"></span>
+        </div>
+        <ul id="saved-list" class="grid max-h-36 gap-0.5 overflow-y-auto"></ul>
       </section>
     </main>
     <script type="module" src="./main.ts"></script>

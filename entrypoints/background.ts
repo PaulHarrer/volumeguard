@@ -18,6 +18,15 @@ import {
   DEFAULT_VOLUME,
   volumeToGain,
 } from '@/lib/volume';
+import {
+  hostOf,
+  normalizeHost,
+  parseSiteVolumes,
+  resolveNavigationVolume,
+  serializeSiteVolumes,
+  SITE_VOLUMES_KEY,
+  toSavedSiteList,
+} from '@/lib/site-volumes';
 
 interface ChromeTabCapture {
   getMediaStreamId: (
@@ -51,18 +60,29 @@ interface ChromeAPI {
 
 const chromeAPI = (globalThis as unknown as { chrome?: ChromeAPI }).chrome;
 const STORAGE_KEY = 'tabVolumes';
+const TAB_HOSTS_KEY = 'tabHosts';
+const AUTO_APPLIED_KEY = 'autoAppliedTabs';
 const ENGINE_FILE = '/audio-engine.js';
 const volumes = new Map<number, number>();
+const tabHosts = new Map<number, string>();
+const autoApplied = new Set<number>();
+const siteVolumes = new Map<string, number>();
 const capturing = new Set<number>();
 const contentArmed = new Set<number>();
 const engineReady = new Set<string>();
-const desired = new Map<number, number>();
+interface VolumeRequest {
+  volume: number;
+  allowCapture: boolean;
+  streamIdPromise?: Promise<string>;
+}
+const desired = new Map<number, VolumeRequest>();
 const runs = new Map<number, Promise<void>>();
 const streamSlots = new Map<number, Promise<string>>();
 const pendingReplies = new Map<number, (reply: AudioReply) => void>();
 let audioPort: Browser.runtime.Port | null = null;
 let commandId = 0;
 let creatingEngine: Promise<void> | null = null;
+let ready: Promise<void> = Promise.resolve();
 
 function canCapture(): boolean {
   return Boolean(chromeAPI?.tabCapture?.getMediaStreamId && chromeAPI.offscreen);
@@ -73,21 +93,61 @@ function sessionStorage(): typeof browser.storage.local | null {
   return session ?? null;
 }
 
-async function persistVolumes(): Promise<void> {
+async function persistSessionState(): Promise<void> {
   const area = sessionStorage();
   if (!area) return;
-  await area.set({ [STORAGE_KEY]: Object.fromEntries(volumes) });
+  await area.set({
+    [STORAGE_KEY]: Object.fromEntries(volumes),
+    [TAB_HOSTS_KEY]: Object.fromEntries(tabHosts),
+    [AUTO_APPLIED_KEY]: Array.from(autoApplied),
+  });
 }
 
-async function restoreVolumes(): Promise<void> {
+async function loadSessionState(): Promise<void> {
   const area = sessionStorage();
   if (!area) return;
-  const data = await area.get(STORAGE_KEY);
+  const data = await area.get([STORAGE_KEY, TAB_HOSTS_KEY, AUTO_APPLIED_KEY]);
   const saved = data[STORAGE_KEY] as Record<string, number> | undefined;
-  if (!saved) return;
-  for (const [id, volume] of Object.entries(saved)) {
-    volumes.set(Number(id), clampVolume(volume));
+  if (saved && typeof saved === 'object') {
+    for (const [id, volume] of Object.entries(saved)) {
+      const tabId = Number(id);
+      if (Number.isFinite(tabId) && typeof volume === 'number') {
+        volumes.set(tabId, clampVolume(volume));
+      }
+    }
   }
+  const savedHosts = data[TAB_HOSTS_KEY] as Record<string, string> | undefined;
+  if (savedHosts && typeof savedHosts === 'object') {
+    for (const [id, host] of Object.entries(savedHosts)) {
+      const tabId = Number(id);
+      if (Number.isFinite(tabId) && typeof host === 'string') {
+        tabHosts.set(tabId, normalizeHost(host));
+      }
+    }
+  }
+  const savedAuto = data[AUTO_APPLIED_KEY] as number[] | undefined;
+  if (Array.isArray(savedAuto)) {
+    for (const id of savedAuto) {
+      if (typeof id === 'number' && Number.isFinite(id)) {
+        autoApplied.add(id);
+      }
+    }
+  }
+}
+
+async function loadSiteVolumes(): Promise<void> {
+  const data = await browser.storage.local.get(SITE_VOLUMES_KEY);
+  const parsed = parseSiteVolumes(data[SITE_VOLUMES_KEY]);
+  siteVolumes.clear();
+  for (const [host, volume] of parsed) {
+    siteVolumes.set(host, volume);
+  }
+}
+
+async function persistSiteVolumes(): Promise<void> {
+  await browser.storage.local.set({
+    [SITE_VOLUMES_KEY]: serializeSiteVolumes(siteVolumes),
+  });
 }
 
 function getVolume(tabId: number): number {
@@ -122,33 +182,25 @@ interface BrowserTab {
   windowId: number;
 }
 
-function hostOf(url?: string): string {
-  if (!url) return '';
-  try {
-    const parsed = new URL(url);
-    if (!/^https?:$/.test(parsed.protocol)) return '';
-    return parsed.hostname.replace(/^www\./, '');
-  } catch {
-    return '';
-  }
-}
-
 function toTabInfo(tab: BrowserTab, activeId: number | undefined): TabVolumeInfo | null {
   if (tab.id == null) return null;
+  const host = hostOf(tab.url);
   return {
     id: tab.id,
     title: tab.title || tab.url || 'Untitled',
-    host: hostOf(tab.url),
+    host,
     favIconUrl: tab.favIconUrl,
     audible: Boolean(tab.audible),
     muted: Boolean(tab.mutedInfo?.muted),
     volume: getVolume(tab.id),
+    savedVolume: host ? (siteVolumes.get(host) ?? null) : null,
     active: tab.id === activeId,
     windowId: tab.windowId,
   };
 }
 
 async function getPopupState(): Promise<PopupState> {
+  await ready;
   const [activeTabs, allTabs] = await Promise.all([
     browser.tabs.query({ active: true, currentWindow: true }),
     browser.tabs.query({}),
@@ -169,7 +221,7 @@ async function getPopupState(): Promise<PopupState> {
     if (info) tabs.push(info);
   }
 
-  return { current, tabs };
+  return { current, tabs, savedSites: toSavedSiteList(siteVolumes) };
 }
 
 function delay(ms: number): Promise<void> {
@@ -367,19 +419,40 @@ function callPageGain(gain: number): boolean | 'missing' | Promise<boolean> {
   return apply ? apply(gain) : 'missing';
 }
 
-async function runEngine(tabId: number, gain: number, world: 'MAIN' | 'ISOLATED'): Promise<boolean> {
+function engineKey(tabId: number, world: 'MAIN' | 'ISOLATED', frameId?: number): string {
+  return frameId != null ? `${tabId}:${world}:${frameId}` : `${tabId}:${world}`;
+}
+
+function clearEngineReady(tabId: number): void {
+  const prefix = `${tabId}:`;
+  for (const key of engineReady) {
+    if (key.startsWith(prefix)) engineReady.delete(key);
+  }
+}
+
+function scriptTarget(tabId: number, frameId?: number): { tabId: number; allFrames?: boolean; frameIds?: number[] } {
+  return frameId != null ? { tabId, frameIds: [frameId] } : { tabId, allFrames: true };
+}
+
+async function runEngine(
+  tabId: number,
+  gain: number,
+  world: 'MAIN' | 'ISOLATED',
+  frameId?: number,
+): Promise<boolean> {
   if (!browser.scripting?.executeScript) return false;
-  const key = `${tabId}:${world}`;
+  const key = engineKey(tabId, world, frameId);
+  const target = scriptTarget(tabId, frameId);
   if (!engineReady.has(key)) {
     await browser.scripting.executeScript({
-      target: { tabId, allFrames: true },
+      target,
       world,
       files: [ENGINE_FILE],
     });
     engineReady.add(key);
   }
   const results = await browser.scripting.executeScript({
-    target: { tabId, allFrames: true },
+    target,
     world,
     func: callPageGain,
     args: [gain],
@@ -391,11 +464,11 @@ async function runEngine(tabId: number, gain: number, world: 'MAIN' | 'ISOLATED'
   return results.some((item) => item.result === true);
 }
 
-async function injectContentScript(tabId: number): Promise<boolean> {
+async function injectContentScript(tabId: number, frameId?: number): Promise<boolean> {
   try {
     if (!browser.scripting?.executeScript) return false;
     await browser.scripting.executeScript({
-      target: { tabId, allFrames: true },
+      target: scriptTarget(tabId, frameId),
       files: ['/content-scripts/content.js'],
     });
     return true;
@@ -404,15 +477,19 @@ async function injectContentScript(tabId: number): Promise<boolean> {
   }
 }
 
-async function messageContent(tabId: number, gain: number): Promise<boolean> {
+async function messageContent(tabId: number, gain: number, frameId?: number): Promise<boolean> {
   const message = { type: MESSAGE.applyGain, gain } satisfies ExtensionMessage;
+  const send = (): Promise<unknown> =>
+    frameId != null
+      ? browser.tabs.sendMessage(tabId, message, { frameId })
+      : browser.tabs.sendMessage(tabId, message);
   try {
-    const response = (await browser.tabs.sendMessage(tabId, message)) as { ok?: boolean } | undefined;
+    const response = (await send()) as { ok?: boolean } | undefined;
     return Boolean(response?.ok);
   } catch {
-    if (!(await injectContentScript(tabId))) return false;
+    if (!(await injectContentScript(tabId, frameId))) return false;
     try {
-      const response = (await browser.tabs.sendMessage(tabId, message)) as { ok?: boolean } | undefined;
+      const response = (await send()) as { ok?: boolean } | undefined;
       return Boolean(response?.ok);
     } catch {
       return false;
@@ -428,18 +505,18 @@ async function releasePageGain(tabId: number): Promise<void> {
   }
 }
 
-async function applyContentGain(tabId: number, volume: number): Promise<void> {
+async function applyContentGain(tabId: number, volume: number, frameId?: number): Promise<void> {
   const gain = volumeToGain(volume);
   let controlled = false;
   try {
-    controlled = await runEngine(tabId, gain, 'MAIN');
+    controlled = await runEngine(tabId, gain, 'MAIN', frameId);
   } catch {
-    engineReady.delete(`${tabId}:MAIN`);
+    engineReady.delete(engineKey(tabId, 'MAIN', frameId));
     try {
-      controlled = await runEngine(tabId, gain, 'ISOLATED');
+      controlled = await runEngine(tabId, gain, 'ISOLATED', frameId);
     } catch {
-      engineReady.delete(`${tabId}:ISOLATED`);
-      controlled = await messageContent(tabId, gain);
+      engineReady.delete(engineKey(tabId, 'ISOLATED', frameId));
+      controlled = await messageContent(tabId, gain, frameId);
     }
   }
   if (!controlled && gain !== 1) throw new Error('Cannot control volume on this page');
@@ -449,11 +526,11 @@ async function applyContentGain(tabId: number, volume: number): Promise<void> {
 async function applyVolume(
   tabId: number,
   volume: number,
-  streamIdPromise?: Promise<string>,
+  options: { allowCapture: boolean; streamIdPromise?: Promise<string> },
 ): Promise<void> {
   const next = clampVolume(volume);
   volumes.set(tabId, next);
-  await persistVolumes();
+  await persistSessionState();
   await updateBadge(tabId, next);
 
   if (next === DEFAULT_VOLUME) {
@@ -481,18 +558,20 @@ async function applyVolume(
         capturing.delete(tabId);
       }
     }
-    try {
-      await startCapture(tabId, next, streamIdPromise);
-      contentArmed.delete(tabId);
-      void releasePageGain(tabId);
-      return;
-    } catch (error) {
-      capturing.delete(tabId);
+    if (options.allowCapture) {
       try {
-        await applyContentGain(tabId, next);
+        await startCapture(tabId, next, options.streamIdPromise);
+        contentArmed.delete(tabId);
+        void releasePageGain(tabId);
         return;
-      } catch {
-        throw error;
+      } catch (error) {
+        capturing.delete(tabId);
+        try {
+          await applyContentGain(tabId, next);
+          return;
+        } catch {
+          throw error;
+        }
       }
     }
   }
@@ -500,19 +579,28 @@ async function applyVolume(
   await applyContentGain(tabId, next);
 }
 
-function enqueueVolume(tabId: number, volume: number, streamIdPromise?: Promise<string>): Promise<void> {
-  desired.set(tabId, volume);
+function enqueueVolume(
+  tabId: number,
+  volume: number,
+  options: { allowCapture: boolean; streamIdPromise?: Promise<string> },
+): Promise<void> {
+  const prev = desired.get(tabId);
+  const allowCapture = options.allowCapture || Boolean(prev?.allowCapture);
+  const streamIdPromise =
+    options.streamIdPromise ?? (allowCapture ? prev?.streamIdPromise : undefined);
+  desired.set(tabId, { volume, allowCapture, streamIdPromise });
   const existing = runs.get(tabId);
   if (existing) return existing;
 
   const run = (async () => {
-    let stream = streamIdPromise;
     while (desired.has(tabId)) {
       const target = desired.get(tabId);
-      if (target == null) return;
+      if (!target) return;
       desired.delete(tabId);
-      await applyVolume(tabId, target, stream);
-      stream = undefined;
+      await applyVolume(tabId, target.volume, {
+        allowCapture: target.allowCapture,
+        streamIdPromise: target.streamIdPromise,
+      });
     }
   })();
 
@@ -521,9 +609,119 @@ function enqueueVolume(tabId: number, volume: number, streamIdPromise?: Promise<
     if (runs.get(tabId) === run) runs.delete(tabId);
     streamSlots.delete(tabId);
     const latest = desired.get(tabId);
-    if (latest != null) void enqueueVolume(tabId, latest);
+    if (latest) {
+      desired.delete(tabId);
+      void enqueueVolume(tabId, latest.volume, {
+        allowCapture: latest.allowCapture,
+        streamIdPromise: latest.streamIdPromise,
+      });
+    }
   });
   return run;
+}
+
+async function syncTabForUrl(
+  tabId: number,
+  url: string | undefined,
+  isDocumentLoad: boolean,
+): Promise<void> {
+  await ready;
+  const nextHost = hostOf(url);
+  const prevHost = tabHosts.get(tabId);
+  const currentVolume = getVolume(tabId);
+  const savedVolume = nextHost ? siteVolumes.get(nextHost) : undefined;
+  const decision = resolveNavigationVolume({
+    prevHost,
+    nextHost,
+    currentVolume,
+    wasAutoApplied: autoApplied.has(tabId),
+    savedVolume,
+  });
+
+  tabHosts.set(tabId, decision.nextHost);
+  if (decision.autoApplied) autoApplied.add(tabId);
+  else autoApplied.delete(tabId);
+  if (decision.volumeChanged) {
+    volumes.set(tabId, decision.nextVolume);
+  }
+
+  if (decision.hostChanged || decision.volumeChanged) {
+    await persistSessionState();
+  }
+  await updateBadge(tabId, decision.nextVolume);
+
+  if (decision.volumeChanged) {
+    await enqueueVolume(tabId, decision.nextVolume, { allowCapture: false }).catch(() => undefined);
+    return;
+  }
+  if (isDocumentLoad && decision.nextVolume !== DEFAULT_VOLUME && !capturing.has(tabId)) {
+    await enqueueVolume(tabId, decision.nextVolume, { allowCapture: false }).catch(() => undefined);
+  }
+}
+
+async function reconcileOpenTabs(): Promise<void> {
+  const allTabs = await browser.tabs.query({});
+  const openIds = new Set<number>();
+  const tasks: Promise<unknown>[] = [];
+
+  for (const tab of allTabs) {
+    if (tab.id != null) openIds.add(tab.id);
+  }
+
+  for (const id of Array.from(volumes.keys())) {
+    if (!openIds.has(id)) volumes.delete(id);
+  }
+  for (const id of Array.from(tabHosts.keys())) {
+    if (!openIds.has(id)) tabHosts.delete(id);
+  }
+  for (const id of Array.from(autoApplied)) {
+    if (!openIds.has(id)) autoApplied.delete(id);
+  }
+
+  for (const tab of allTabs) {
+    const tabId = tab.id;
+    if (tabId == null) continue;
+    const host = hostOf(tab.url);
+    if (volumes.has(tabId)) {
+      if (!tabHosts.has(tabId)) tabHosts.set(tabId, host);
+      const volume = getVolume(tabId);
+      tasks.push(updateBadge(tabId, volume));
+      if (
+        volume !== DEFAULT_VOLUME &&
+        !capturing.has(tabId) &&
+        !contentArmed.has(tabId) &&
+        !runs.has(tabId)
+      ) {
+        tasks.push(enqueueVolume(tabId, volume, { allowCapture: false }));
+      }
+    } else if (!tabHosts.has(tabId)) {
+      tabHosts.set(tabId, host);
+      if (host && siteVolumes.has(host)) {
+        const saved = clampVolume(siteVolumes.get(host) ?? DEFAULT_VOLUME);
+        volumes.set(tabId, saved);
+        autoApplied.add(tabId);
+        tasks.push(updateBadge(tabId, saved));
+        if (saved !== DEFAULT_VOLUME) {
+          tasks.push(enqueueVolume(tabId, saved, { allowCapture: false }));
+        }
+      }
+    }
+  }
+
+  await persistSessionState();
+  await Promise.allSettled(tasks);
+}
+
+function cleanupTabState(tabId: number): void {
+  volumes.delete(tabId);
+  tabHosts.delete(tabId);
+  autoApplied.delete(tabId);
+  desired.delete(tabId);
+  contentArmed.delete(tabId);
+  clearEngineReady(tabId);
+  streamSlots.delete(tabId);
+  void ready.then(() => persistSessionState());
+  void stopCapture(tabId);
 }
 
 async function focusTab(tabId: number): Promise<void> {
@@ -533,6 +731,18 @@ async function focusTab(tabId: number): Promise<void> {
 }
 
 export default defineBackground(() => {
+  ready = Promise.all([loadSessionState(), loadSiteVolumes()]).then(() => undefined);
+  void ready.then(reconcileOpenTabs);
+
+  browser.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName !== 'local' || !changes[SITE_VOLUMES_KEY]) return;
+    const parsed = parseSiteVolumes(changes[SITE_VOLUMES_KEY].newValue);
+    siteVolumes.clear();
+    for (const [host, volume] of parsed) {
+      siteVolumes.set(host, volume);
+    }
+  });
+
   browser.runtime.onConnect.addListener((port) => {
     if (port.name !== AUDIO_PORT) return;
     if (port.sender?.id !== browser.runtime.id || port.sender.tab) return;
@@ -541,26 +751,7 @@ export default defineBackground(() => {
     bindAudioPort(port);
   });
 
-  void restoreVolumes().then(async () => {
-    for (const [tabId, volume] of volumes) {
-      try {
-        await browser.tabs.get(tabId);
-      } catch {
-        volumes.delete(tabId);
-        continue;
-      }
-      if (volume === DEFAULT_VOLUME) continue;
-      try {
-        await updateBadge(tabId, volume);
-        await enqueueVolume(tabId, volume);
-      } catch {
-        continue;
-      }
-    }
-    await persistVolumes();
-  });
-
-  browser.runtime.onMessage.addListener((raw, _sender, sendResponse) => {
+  browser.runtime.onMessage.addListener((raw, sender, sendResponse) => {
     if (!isExtensionMessage(raw)) return;
 
     if (raw.type === MESSAGE.getState) {
@@ -578,21 +769,98 @@ export default defineBackground(() => {
         canCapture() &&
         volume !== DEFAULT_VOLUME &&
         !capturing.has(raw.tabId) &&
-        !runs.has(raw.tabId) &&
         !streamSlots.has(raw.tabId)
       ) {
         streamIdPromise = requestStreamId(raw.tabId);
+        void streamIdPromise.catch(() => undefined);
         streamSlots.set(raw.tabId, streamIdPromise);
       }
-      void enqueueVolume(raw.tabId, volume, streamIdPromise)
-        .then(() => getPopupState())
+      void ready
+        .then(async () => {
+          let host = tabHosts.get(raw.tabId);
+          if (host === undefined) {
+            try {
+              const tab = await browser.tabs.get(raw.tabId);
+              host = hostOf(tab.url);
+              tabHosts.set(raw.tabId, host);
+            } catch {
+              host = '';
+            }
+          }
+          const saved = host ? siteVolumes.get(host) : undefined;
+          if (saved !== volume) {
+            autoApplied.delete(raw.tabId);
+          }
+          await enqueueVolume(raw.tabId, volume, { allowCapture: true, streamIdPromise });
+          return getPopupState();
+        })
         .then((state) => sendResponse(state))
         .catch(async (error: unknown) => {
-          const failed = await getPopupState();
+          const failed = await getPopupState().catch(() => ({
+            current: null,
+            tabs: [],
+            savedSites: toSavedSiteList(siteVolumes),
+          }));
           failed.error = userError(error);
           sendResponse(failed);
         });
       return true;
+    }
+
+    if (raw.type === MESSAGE.saveSiteVolume) {
+      void ready
+        .then(async () => {
+          const host = normalizeHost(raw.host);
+          if (host) {
+            siteVolumes.set(host, clampVolume(raw.volume));
+            await persistSiteVolumes();
+            if (raw.tabId != null) {
+              const currentHost = tabHosts.get(raw.tabId);
+              if (!currentHost || currentHost === host) {
+                tabHosts.set(raw.tabId, host);
+                autoApplied.add(raw.tabId);
+                await persistSessionState();
+              }
+            }
+          }
+          return getPopupState();
+        })
+        .then((state) => sendResponse(state))
+        .catch(() => sendResponse(undefined));
+      return true;
+    }
+
+    if (raw.type === MESSAGE.removeSiteVolume) {
+      void ready
+        .then(async () => {
+          const host = normalizeHost(raw.host);
+          if (host && siteVolumes.delete(host)) {
+            await persistSiteVolumes();
+          }
+          return getPopupState();
+        })
+        .then((state) => sendResponse(state))
+        .catch(() => sendResponse(undefined));
+      return true;
+    }
+
+    if (raw.type === MESSAGE.pageReady) {
+      const tabId = sender.tab?.id;
+      if (tabId == null) return;
+      const frameId = sender.frameId ?? 0;
+      if (frameId === 0) {
+        clearEngineReady(tabId);
+        contentArmed.delete(tabId);
+        void syncTabForUrl(tabId, sender.tab?.url ?? sender.url, true);
+      } else {
+        void ready.then(async () => {
+          const vol = getVolume(tabId);
+          if (vol !== DEFAULT_VOLUME && !capturing.has(tabId)) {
+            await applyContentGain(tabId, vol, frameId).catch(() => undefined);
+          }
+        });
+      }
+      return;
     }
 
     if (raw.type === MESSAGE.focusTab) {
@@ -607,23 +875,41 @@ export default defineBackground(() => {
   });
 
   browser.tabs.onRemoved.addListener((tabId) => {
-    volumes.delete(tabId);
-    desired.delete(tabId);
-    contentArmed.delete(tabId);
-    engineReady.delete(`${tabId}:MAIN`);
-    engineReady.delete(`${tabId}:ISOLATED`);
-    streamSlots.delete(tabId);
-    void persistVolumes();
-    void stopCapture(tabId);
+    cleanupTabState(tabId);
   });
 
-  browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
-    if (changeInfo.status !== 'loading') return;
-    capturing.delete(tabId);
-    engineReady.delete(`${tabId}:MAIN`);
-    engineReady.delete(`${tabId}:ISOLATED`);
-    const volume = getVolume(tabId);
-    if (volume === DEFAULT_VOLUME) return;
-    void enqueueVolume(tabId, volume).catch(() => undefined);
+  browser.tabs.onReplaced?.addListener((addedTabId, removedTabId) => {
+    cleanupTabState(removedTabId);
+    void browser.tabs
+      .get(addedTabId)
+      .then((tab) => syncTabForUrl(addedTabId, tab.url, true))
+      .catch(() => undefined);
+  });
+
+  browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+    if (changeInfo.status === 'loading') {
+      clearEngineReady(tabId);
+      contentArmed.delete(tabId);
+      void syncTabForUrl(tabId, changeInfo.url ?? tab.url, true);
+      return;
+    }
+    if (changeInfo.url) {
+      void syncTabForUrl(tabId, changeInfo.url, false);
+      return;
+    }
+    if (changeInfo.status === 'complete') {
+      void ready.then(async () => {
+        const nextHost = hostOf(tab.url);
+        if (tabHosts.get(tabId) !== nextHost) {
+          await syncTabForUrl(tabId, tab.url, true);
+          return;
+        }
+        const volume = getVolume(tabId);
+        await updateBadge(tabId, volume);
+        if (volume !== DEFAULT_VOLUME && !capturing.has(tabId) && !contentArmed.has(tabId)) {
+          await enqueueVolume(tabId, volume, { allowCapture: false }).catch(() => undefined);
+        }
+      });
+    }
   });
 });

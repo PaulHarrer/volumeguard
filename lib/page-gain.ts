@@ -12,6 +12,7 @@ interface PageEngine {
   patched: boolean;
   bound: boolean;
   gestureBound: boolean;
+  onMedia: ((event: Event) => void) | null;
 }
 
 function engine(): PageEngine {
@@ -31,6 +32,7 @@ function engine(): PageEngine {
       patched: false,
       bound: false,
       gestureBound: false,
+      onMedia: null,
     };
   }
   return host.__vg;
@@ -102,7 +104,10 @@ async function mediaGraph(state: PageEngine): Promise<GainNode | null> {
   writeGain(state.node, state.gain);
   if (state.ctx.state !== 'running') {
     try {
-      await state.ctx.resume();
+      await Promise.race([
+        state.ctx.resume(),
+        new Promise<void>((resolve) => setTimeout(resolve, 150)),
+      ]);
     } catch {
       return null;
     }
@@ -113,17 +118,33 @@ async function mediaGraph(state: PageEngine): Promise<GainNode | null> {
 function watchGesture(state: PageEngine): void {
   if (state.gestureBound) return;
   state.gestureBound = true;
-  document.addEventListener(
-    'pointerdown',
-    () => {
-      void applyPageGain(state.gain);
-    },
-    true,
-  );
+  const onGesture = (): void => {
+    if (state.ctx && state.ctx.state !== 'running') {
+      void state.ctx.resume().catch(() => undefined);
+    }
+    void applyPageGain(state.gain).then(() => {
+      if (state.gain === 1 || state.ctx?.state === 'running') {
+        document.removeEventListener('pointerdown', onGesture, true);
+        document.removeEventListener('keydown', onGesture, true);
+        document.removeEventListener('click', onGesture, true);
+        state.gestureBound = false;
+      }
+    });
+  };
+  document.addEventListener('pointerdown', onGesture, true);
+  document.addEventListener('keydown', onGesture, true);
+  document.addEventListener('click', onGesture, true);
 }
 
 async function hook(state: PageEngine, el: HTMLMediaElement): Promise<'hooked' | 'attenuated' | 'missed' | 'idle'> {
   if (state.hooked.has(el)) return 'hooked';
+  if (state.gain === 1) {
+    if (state.originals.has(el)) {
+      el.volume = state.originals.get(el) ?? el.volume;
+      state.originals.delete(el);
+    }
+    return 'idle';
+  }
   const active = isPlaying(el) || Boolean(mediaSource(el));
   if (!active) return 'idle';
   if (state.blocked.has(el) || !canHook(el)) {
@@ -149,11 +170,23 @@ async function hook(state: PageEngine, el: HTMLMediaElement): Promise<'hooked' |
   }
 }
 
+function attachMediaListeners(state: PageEngine, target: EventTarget): void {
+  if (!state.onMedia) {
+    state.onMedia = (event: Event): void => {
+      if (event.target instanceof HTMLMediaElement) void hook(state, event.target);
+    };
+  }
+  target.addEventListener('play', state.onMedia, true);
+  target.addEventListener('playing', state.onMedia, true);
+  target.addEventListener('loadedmetadata', state.onMedia, true);
+}
+
 function watch(state: PageEngine, root: Node): void {
   if (!state.observer || state.watched.has(root)) return;
   try {
     state.observer.observe(root, { childList: true, subtree: true });
     state.watched.add(root);
+    if (root instanceof ShadowRoot) attachMediaListeners(state, root);
   } catch {
     return;
   }
@@ -182,11 +215,7 @@ function bind(state: PageEngine): void {
       }
     }
   });
-  const onMedia = (event: Event): void => {
-    if (event.target instanceof HTMLMediaElement) void hook(state, event.target);
-  };
-  document.addEventListener('play', onMedia, true);
-  document.addEventListener('loadedmetadata', onMedia, true);
+  attachMediaListeners(state, document);
   const root = document.documentElement;
   if (root) watch(state, root);
 }
