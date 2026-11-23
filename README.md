@@ -29,7 +29,7 @@ Open the toolbar popup on a tab and set that tab's volume.
 
 On Chrome, Volume Guard captures the tab and plays it back through an offscreen document with a gain stage and a limiter. That is how levels above 100% work when the page will not expose its media elements. If capture fails, it falls back to adjusting audio inside the page. Capture needs the popup gesture. If Chrome says the extension has not been invoked, open Volume Guard on that tab and try again.
 
-Firefox has no tab capture. Volume Guard adjusts `<audio>`, `<video>`, and Web Audio output inside the page instead. Firefox 109 or newer is required. The extension id is `volumeguard@volumeguard.dev`.
+Firefox has no tab capture. Volume Guard adjusts `<audio>`, `<video>`, and Web Audio output inside the page instead. Firefox 109 or newer is required.
 
 Some audio cannot be boosted above 100%: cross-origin media without CORS, and DRM streams that use MediaKeys. Those can still be lowered when the element volume is writable. Browser pages such as `chrome://` and `about:` cannot be controlled. If another extension is already capturing the tab, Chrome capture is blocked.
 
